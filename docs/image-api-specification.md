@@ -77,6 +77,443 @@ CREATE INDEX idx_images_c2pa_verified ON images(c2pa_verified);
 
 ---
 
+## Drizzle ORM Schema
+
+### Overview
+
+This project uses [Drizzle ORM](https://orm.drizzle.team/) for type-safe database operations with Cloudflare D1. Drizzle provides compile-time type checking, excellent TypeScript integration, and a lightweight runtime.
+
+### Images Table Definition
+
+**Location:** `packages/db/schema.ts`
+
+```typescript
+import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+
+export const images = sqliteTable("images", {
+  // Primary identification
+  id: text("id").primaryKey(),
+  originalFilename: text("original_filename").notNull(),
+  cloudflareImageId: text("cloudflare_image_id").notNull().unique(),
+
+  // Basic metadata
+  mimeType: text("mime_type").notNull(),
+  fileSize: integer("file_size").notNull(),
+  width: integer("width"),
+  height: integer("height"),
+
+  // Upload information
+  uploadedAt: integer("uploaded_at", { mode: "timestamp_ms" }).notNull(),
+  uploadedBy: text("uploaded_by"),
+
+  // EXIF metadata (JSON blob)
+  exifData: text("exif_data"),  // JSON string containing all EXIF data
+
+  // IPTC metadata (JSON blob)
+  iptcData: text("iptc_data"),  // JSON string containing all IPTC data
+
+  // C2PA Content Authenticity
+  c2paManifest: text("c2pa_manifest"),  // JSON string containing C2PA manifest
+  c2paVerified: integer("c2pa_verified", { mode: "boolean" }).default(false),
+  c2paSignatureValid: integer("c2pa_signature_valid", { mode: "boolean" }),
+  c2paIssuer: text("c2pa_issuer"),
+
+  // Cloudflare Images URLs
+  cloudflareUrlBase: text("cloudflare_url_base"),
+  cloudflareUrlPublic: text("cloudflare_url_public"),
+
+  // Image variants (JSON array of available variants)
+  variants: text("variants"),  // JSON array of variant names/sizes
+
+  // Additional metadata
+  description: text("description"),
+  tags: text("tags"),  // JSON array of tags
+
+  // Status and flags
+  status: text("status").default("active"),  // active, archived, deleted
+  isPublic: integer("is_public", { mode: "boolean" }).default(false),
+
+  // Timestamps
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+  deletedAt: integer("deleted_at", { mode: "timestamp_ms" })
+});
+
+// Type inference for TypeScript
+export type Image = typeof images.$inferSelect;
+export type NewImage = typeof images.$inferInsert;
+```
+
+### Schema Field Mappings
+
+| TypeScript Field      | Database Column          | Type      | Purpose                                    |
+|-----------------------|--------------------------|-----------|-------------------------------------------|
+| `id`                  | `id`                     | text      | Unique image identifier (primary key)     |
+| `originalFilename`    | `original_filename`      | text      | Original uploaded filename                |
+| `cloudflareImageId`   | `cloudflare_image_id`    | text      | Cloudflare Images unique ID (unique)      |
+| `mimeType`            | `mime_type`              | text      | Image MIME type (e.g., image/jpeg)        |
+| `fileSize`            | `file_size`              | integer   | File size in bytes                        |
+| `width`               | `width`                  | integer   | Image width in pixels                     |
+| `height`              | `height`                 | integer   | Image height in pixels                    |
+| `uploadedAt`          | `uploaded_at`            | timestamp | Upload timestamp (milliseconds)           |
+| `uploadedBy`          | `uploaded_by`            | text      | User ID who uploaded                      |
+| `exifData`            | `exif_data`              | text      | JSON-encoded EXIF metadata                |
+| `iptcData`            | `iptc_data`              | text      | JSON-encoded IPTC metadata                |
+| `c2paManifest`        | `c2pa_manifest`          | text      | JSON-encoded C2PA manifest                |
+| `c2paVerified`        | `c2pa_verified`          | boolean   | Whether C2PA verification passed          |
+| `c2paSignatureValid`  | `c2pa_signature_valid`   | boolean   | Whether C2PA signature is valid           |
+| `c2paIssuer`          | `c2pa_issuer`            | text      | C2PA certificate issuer                   |
+| `cloudflareUrlBase`   | `cloudflare_url_base`    | text      | Base URL for Cloudflare delivery          |
+| `cloudflareUrlPublic` | `cloudflare_url_public`  | text      | Public variant URL                        |
+| `variants`            | `variants`               | text      | JSON array of available variant names     |
+| `description`         | `description`            | text      | User-provided description                 |
+| `tags`                | `tags`                   | text      | JSON array of tags                        |
+| `status`              | `status`                 | text      | Record status (active/archived/deleted)   |
+| `isPublic`            | `is_public`              | boolean   | Whether image is publicly accessible      |
+| `updatedAt`           | `updated_at`             | timestamp | Last update timestamp (milliseconds)      |
+| `deletedAt`           | `deleted_at`             | timestamp | Soft delete timestamp (milliseconds)      |
+
+### Type Safety Features
+
+**Type Inference:**
+```typescript
+// Selecting (reading) from database - includes all fields
+type Image = {
+  id: string;
+  originalFilename: string;
+  cloudflareImageId: string;
+  mimeType: string;
+  fileSize: number;
+  width: number | null;
+  height: number | null;
+  uploadedAt: Date;
+  uploadedBy: string | null;
+  exifData: string | null;
+  iptcData: string | null;
+  c2paManifest: string | null;
+  c2paVerified: boolean;
+  c2paSignatureValid: boolean | null;
+  c2paIssuer: string | null;
+  cloudflareUrlBase: string | null;
+  cloudflareUrlPublic: string | null;
+  variants: string | null;
+  description: string | null;
+  tags: string | null;
+  status: string;
+  isPublic: boolean;
+  updatedAt: Date;
+  deletedAt: Date | null;
+};
+
+// Inserting (creating) records - omits auto-generated/optional fields
+type NewImage = {
+  id: string;
+  originalFilename: string;
+  cloudflareImageId: string;
+  mimeType: string;
+  fileSize: number;
+  width?: number | null;
+  height?: number | null;
+  uploadedAt: Date;
+  uploadedBy?: string | null;
+  exifData?: string | null;
+  iptcData?: string | null;
+  c2paManifest?: string | null;
+  c2paVerified?: boolean;
+  c2paSignatureValid?: boolean | null;
+  c2paIssuer?: string | null;
+  cloudflareUrlBase?: string | null;
+  cloudflareUrlPublic?: string | null;
+  variants?: string | null;
+  description?: string | null;
+  tags?: string | null;
+  status?: string;
+  isPublic?: boolean;
+  updatedAt: Date;
+  deletedAt?: Date | null;
+};
+```
+
+### JSON Field Handling
+
+Several fields store JSON data as text and require parsing/serialization:
+
+**EXIF Data Structure:**
+```typescript
+interface ExifData {
+  Make?: string;
+  Model?: string;
+  DateTime?: string;
+  DateTimeOriginal?: string;
+  DateTimeDigitized?: string;
+  FocalLength?: string;
+  FNumber?: number;
+  ISO?: number;
+  ShutterSpeed?: string;
+  WhiteBalance?: string;
+  Flash?: string;
+  Lens?: string;
+  GPS?: {
+    latitude: number;
+    longitude: number;
+    altitude?: number;
+  };
+  Width?: number;
+  Height?: number;
+  Resolution?: number;
+  ColorSpace?: string;
+  Orientation?: number;
+}
+```
+
+**IPTC Data Structure:**
+```typescript
+interface IptcData {
+  caption?: string;
+  headline?: string;
+  keywords?: string[];
+  category?: string;
+  creator?: string;
+  creatorContactInfo?: {
+    city?: string;
+    country?: string;
+    address?: string;
+    postalCode?: string;
+    phone?: string;
+    email?: string;
+    website?: string;
+  };
+  copyright?: string;
+  usageTerms?: string;
+  city?: string;
+  state?: string;
+  country?: string;
+  location?: string;
+  sublocation?: string;
+  copyrightStatus?: string;
+  rightsUsageTerms?: string;
+  webStatement?: string;
+}
+```
+
+**C2PA Manifest Structure:**
+```typescript
+interface C2paManifest {
+  claim_generator: string;
+  claim_generator_info?: any[];
+  signature_valid: boolean;
+  issuer: string;
+  assertions: Array<{
+    label: string;
+    data: any;
+  }>;
+  ingredients: Array<{
+    title: string;
+    format: string;
+    relationship: string;
+  }>;
+  signature_info: {
+    alg: string;
+    time: string;
+    issuer: string;
+  };
+}
+```
+
+**Variants Array:**
+```typescript
+type Variants = string[]; // e.g., ["public", "thumbnail", "medium", "large"]
+```
+
+**Tags Array:**
+```typescript
+type Tags = string[]; // e.g., ["nature", "landscape", "sunset"]
+```
+
+### Helper Functions for JSON Fields
+
+```typescript
+// Serialize/deserialize EXIF data
+function serializeExif(exif: ExifData): string {
+  return JSON.stringify(exif);
+}
+
+function deserializeExif(exifString: string | null): ExifData | null {
+  if (!exifString) return null;
+  try {
+    return JSON.parse(exifString);
+  } catch {
+    return null;
+  }
+}
+
+// Serialize/deserialize IPTC data
+function serializeIptc(iptc: IptcData): string {
+  return JSON.stringify(iptc);
+}
+
+function deserializeIptc(iptcString: string | null): IptcData | null {
+  if (!iptcString) return null;
+  try {
+    return JSON.parse(iptcString);
+  } catch {
+    return null;
+  }
+}
+
+// Serialize/deserialize C2PA manifest
+function serializeC2pa(manifest: C2paManifest): string {
+  return JSON.stringify(manifest);
+}
+
+function deserializeC2pa(manifestString: string | null): C2paManifest | null {
+  if (!manifestString) return null;
+  try {
+    return JSON.parse(manifestString);
+  } catch {
+    return null;
+  }
+}
+
+// Serialize/deserialize variants
+function serializeVariants(variants: string[]): string {
+  return JSON.stringify(variants);
+}
+
+function deserializeVariants(variantsString: string | null): string[] {
+  if (!variantsString) return [];
+  try {
+    return JSON.parse(variantsString);
+  } catch {
+    return [];
+  }
+}
+
+// Serialize/deserialize tags
+function serializeTags(tags: string[]): string {
+  return JSON.stringify(tags);
+}
+
+function deserializeTags(tagsString: string | null): string[] {
+  if (!tagsString) return [];
+  try {
+    return JSON.parse(tagsString);
+  } catch {
+    return [];
+  }
+}
+```
+
+### Drizzle Usage Examples
+
+**Querying a single image:**
+```typescript
+import { db } from './db/client';
+import { images } from './db/schema';
+import { eq } from 'drizzle-orm';
+
+const image = await db
+  .select()
+  .from(images)
+  .where(eq(images.id, 'img_abc123'))
+  .get();
+
+// Parse JSON fields
+const exif = deserializeExif(image.exifData);
+const iptc = deserializeIptc(image.iptcData);
+const c2pa = deserializeC2pa(image.c2paManifest);
+```
+
+**Inserting a new image:**
+```typescript
+const newImage: NewImage = {
+  id: generateId(),
+  originalFilename: 'photo.jpg',
+  cloudflareImageId: 'cf_xyz789',
+  mimeType: 'image/jpeg',
+  fileSize: 2048576,
+  width: 4032,
+  height: 3024,
+  uploadedAt: new Date(),
+  uploadedBy: 'user123',
+  exifData: serializeExif(extractedExif),
+  iptcData: serializeIptc(extractedIptc),
+  c2paManifest: serializeC2pa(extractedC2pa),
+  c2paVerified: true,
+  c2paSignatureValid: true,
+  c2paIssuer: 'Adobe Content Credentials',
+  cloudflareUrlPublic: 'https://...',
+  variants: serializeVariants(['public', 'thumbnail']),
+  status: 'active',
+  isPublic: false,
+  updatedAt: new Date()
+};
+
+await db.insert(images).values(newImage);
+```
+
+**Filtering and pagination:**
+```typescript
+import { and, eq, gte, lte, desc } from 'drizzle-orm';
+
+const results = await db
+  .select()
+  .from(images)
+  .where(
+    and(
+      eq(images.status, 'active'),
+      eq(images.uploadedBy, 'user123'),
+      gte(images.uploadedAt, startDate),
+      lte(images.uploadedAt, endDate)
+    )
+  )
+  .orderBy(desc(images.uploadedAt))
+  .limit(20)
+  .offset(0);
+```
+
+**Updating image metadata:**
+```typescript
+await db
+  .update(images)
+  .set({
+    description: 'Updated description',
+    tags: serializeTags(['new', 'tags']),
+    updatedAt: new Date()
+  })
+  .where(eq(images.id, 'img_abc123'));
+```
+
+**Soft delete:**
+```typescript
+await db
+  .update(images)
+  .set({
+    status: 'deleted',
+    deletedAt: new Date(),
+    updatedAt: new Date()
+  })
+  .where(eq(images.id, 'img_abc123'));
+```
+
+**Hard delete:**
+```typescript
+await db
+  .delete(images)
+  .where(eq(images.id, 'img_abc123'));
+```
+
+### Benefits of Drizzle ORM
+
+1. **Type Safety:** Full TypeScript support with compile-time type checking
+2. **Lightweight:** Minimal runtime overhead compared to heavier ORMs
+3. **SQL-like Syntax:** Familiar query builder that resembles SQL
+4. **Edge-Ready:** Optimized for Cloudflare Workers and edge runtimes
+5. **Migration Support:** Built-in schema migration tools
+6. **Flexibility:** Can drop down to raw SQL when needed
+7. **Auto-completion:** IDE support for schema fields and queries
+
+---
+
 ## API Endpoints
 
 ### Base URL
@@ -166,6 +603,84 @@ CREATE INDEX idx_images_c2pa_verified ON images(c2pa_verified);
 **Query Parameters:**
 - `include_metadata` (boolean): Include full EXIF/IPTC/C2PA data (default: true)
 
+**Implementation Details:**
+
+This endpoint uses Drizzle ORM to query the images table and transform the data for API consumption:
+
+```typescript
+import { db } from '@/db/client';
+import { images } from '@/db/schema';
+import { eq } from 'drizzle-orm';
+
+async function getImageById(id: string, includeMetadata = true) {
+  // Query the database using Drizzle
+  const image = await db
+    .select()
+    .from(images)
+    .where(eq(images.id, id))
+    .get();
+
+  if (!image) {
+    throw new NotFoundError('Image not found');
+  }
+
+  // Parse JSON fields from the database
+  const exifData = deserializeExif(image.exifData);
+  const iptcData = deserializeIptc(image.iptcData);
+  const c2paManifest = deserializeC2pa(image.c2paManifest);
+  const variants = deserializeVariants(image.variants);
+  const tags = deserializeTags(image.tags);
+
+  // Transform database record to API response format
+  const response = {
+    id: image.id,
+    original_filename: image.originalFilename,
+    cloudflare_image_id: image.cloudflareImageId,
+    mime_type: image.mimeType,
+    file_size: image.fileSize,
+    width: image.width,
+    height: image.height,
+    uploaded_at: image.uploadedAt.toISOString(),
+    uploaded_by: image.uploadedBy,
+    description: image.description,
+    tags: tags,
+    status: image.status,
+    is_public: image.isPublic,
+    cloudflare_url_public: image.cloudflareUrlPublic,
+    variants: variants,
+    updated_at: image.updatedAt.toISOString(),
+  };
+
+  // Conditionally include metadata based on query parameter
+  if (includeMetadata) {
+    return {
+      ...response,
+      exif_data: exifData,
+      iptc_data: iptcData,
+      c2pa_manifest: c2paManifest,
+      c2pa_verified: image.c2paVerified,
+      c2pa_signature_valid: image.c2paSignatureValid,
+      c2pa_issuer: image.c2paIssuer,
+    };
+  }
+
+  return response;
+}
+```
+
+**Data Transformation Flow:**
+
+1. **Query Database:** Use Drizzle to select the image record by ID
+2. **Deserialize JSON Fields:** Parse stored JSON strings into typed objects
+   - `exifData` → `ExifData` object
+   - `iptcData` → `IptcData` object
+   - `c2paManifest` → `C2paManifest` object
+   - `variants` → string array
+   - `tags` → string array
+3. **Transform Field Names:** Convert camelCase (TypeScript) to snake_case (API)
+4. **Format Timestamps:** Convert Date objects to ISO 8601 strings
+5. **Conditional Metadata:** Include/exclude full metadata based on query parameter
+
 **Response:** `200 OK`
 ```json
 {
@@ -184,10 +699,53 @@ CREATE INDEX idx_images_c2pa_verified ON images(c2pa_verified);
     "tags": ["nature", "landscape"],
     "status": "active",
     "is_public": false,
-    "exif_data": {...},
-    "iptc_data": {...},
-    "c2pa_manifest": {...},
+    "exif_data": {
+      "Make": "Canon",
+      "Model": "EOS R5",
+      "DateTime": "2025:10:20 14:30:00",
+      "FocalLength": "50mm",
+      "FNumber": 2.8,
+      "ISO": 100,
+      "GPS": {
+        "latitude": 42.3923,
+        "longitude": -83.0495
+      }
+    },
+    "iptc_data": {
+      "caption": "Beautiful sunset over the lake",
+      "creator": "John Doe",
+      "copyright": "© 2025 John Doe",
+      "keywords": ["nature", "landscape", "sunset"]
+    },
+    "c2pa_manifest": {
+      "claim_generator": "Adobe Photoshop 24.0",
+      "signature_valid": true,
+      "issuer": "Adobe Content Credentials",
+      "assertions": [
+        {
+          "label": "c2pa.actions",
+          "data": {
+            "actions": [
+              {
+                "action": "c2pa.edited",
+                "when": "2025-10-20T14:30:00Z",
+                "softwareAgent": "Adobe Photoshop 24.0"
+              }
+            ]
+          }
+        }
+      ],
+      "ingredients": [
+        {
+          "title": "original_photo.jpg",
+          "format": "image/jpeg",
+          "relationship": "parentOf"
+        }
+      ]
+    },
     "c2pa_verified": true,
+    "c2pa_signature_valid": true,
+    "c2pa_issuer": "Adobe Content Credentials",
     "cloudflare_url_public": "https://imagedelivery.net/account-hash/cf_xyz789/public",
     "variants": ["public", "thumbnail", "medium", "large"],
     "updated_at": "2025-10-24T12:00:00Z"
@@ -195,8 +753,53 @@ CREATE INDEX idx_images_c2pa_verified ON images(c2pa_verified);
 }
 ```
 
+**Response with `include_metadata=false`:**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "img_abc123def456",
+    "original_filename": "photo.jpg",
+    "cloudflare_image_id": "cf_xyz789",
+    "mime_type": "image/jpeg",
+    "file_size": 2048576,
+    "width": 4032,
+    "height": 3024,
+    "uploaded_at": "2025-10-24T12:00:00Z",
+    "uploaded_by": "user123",
+    "description": "Sample description",
+    "tags": ["nature", "landscape"],
+    "status": "active",
+    "is_public": false,
+    "cloudflare_url_public": "https://imagedelivery.net/account-hash/cf_xyz789/public",
+    "variants": ["public", "thumbnail", "medium", "large"],
+    "updated_at": "2025-10-24T12:00:00Z"
+  }
+}
+```
+
+**Exposed Metadata Fields:**
+
+From the Drizzle schema, the following metadata is exposed through this endpoint:
+
+| Field                  | Source               | Description                                    |
+|------------------------|----------------------|------------------------------------------------|
+| `exif_data`            | `images.exifData`    | Complete EXIF metadata from image file         |
+| `iptc_data`            | `images.iptcData`    | Complete IPTC metadata (copyright, creator)    |
+| `c2pa_manifest`        | `images.c2paManifest`| Full C2PA content authenticity manifest        |
+| `c2pa_verified`        | `images.c2paVerified`| Boolean indicating C2PA verification status    |
+| `c2pa_signature_valid` | `images.c2paSignatureValid` | Boolean for signature validity       |
+| `c2pa_issuer`          | `images.c2paIssuer`  | Certificate issuer name                        |
+
+**Performance Considerations:**
+
+- The `include_metadata` parameter allows clients to skip large JSON payloads when only basic info is needed
+- Metadata parsing only occurs when requested
+- Single database query using Drizzle's optimized SQLite adapter
+- JSON deserialization is done lazily
+
 **Error Responses:**
-- `404 Not Found` - Image does not exist
+- `404 Not Found` - Image does not exist or has been deleted
 
 ---
 
