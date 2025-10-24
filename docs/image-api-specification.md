@@ -61,6 +61,7 @@ CREATE TABLE images (
   -- Status and flags
   status TEXT DEFAULT 'active', -- active, archived, deleted
   is_public BOOLEAN DEFAULT FALSE,
+  metadata_status TEXT DEFAULT 'pending', -- pending, processing, completed, failed
 
   -- Timestamps
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -73,6 +74,7 @@ CREATE INDEX idx_images_uploaded_at ON images(uploaded_at);
 CREATE INDEX idx_images_status ON images(status);
 CREATE INDEX idx_images_uploaded_by ON images(uploaded_by);
 CREATE INDEX idx_images_c2pa_verified ON images(c2pa_verified);
+CREATE INDEX idx_images_metadata_status ON images(metadata_status);
 ```
 
 ---
@@ -132,6 +134,7 @@ export const images = sqliteTable("images", {
   // Status and flags
   status: text("status").default("active"),  // active, archived, deleted
   isPublic: integer("is_public", { mode: "boolean" }).default(false),
+  metadataStatus: text("metadata_status").default("pending"),  // pending, processing, completed, failed
 
   // Timestamps
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
@@ -169,6 +172,7 @@ export type NewImage = typeof images.$inferInsert;
 | `tags`                | `tags`                   | text      | JSON array of tags                        |
 | `status`              | `status`                 | text      | Record status (active/archived/deleted)   |
 | `isPublic`            | `is_public`              | boolean   | Whether image is publicly accessible      |
+| `metadataStatus`      | `metadata_status`        | text      | Metadata processing status (pending/processing/completed/failed) |
 | `updatedAt`           | `updated_at`             | timestamp | Last update timestamp (milliseconds)      |
 | `deletedAt`           | `deleted_at`             | timestamp | Soft delete timestamp (milliseconds)      |
 
@@ -1126,7 +1130,42 @@ Extracting image metadata (EXIF, IPTC, C2PA) in Cloudflare Workers presents uniq
 
 ### Implementation Strategies
 
-#### Strategy 1: Edge Extraction (Recommended for Small-Medium Images)
+#### Strategy 1: Deferred Processing (⭐ RECOMMENDED)
+
+Upload to Cloudflare Images first, then extract ALL metadata asynchronously.
+
+**Flow:**
+1. Upload image to Cloudflare Images
+2. Store basic record in D1 (ID, filename, Cloudflare ID, file size, MIME type)
+3. Queue metadata extraction job
+4. Return immediately with image ID and Cloudflare URLs
+5. Background worker extracts EXIF, IPTC, C2PA and updates database
+
+**Pros:**
+- **Simplest architecture** - single code path for all images
+- **Fast, consistent response times** - no variability based on file size
+- **No Worker timeout concerns** - upload completes in milliseconds
+- **Images immediately available** - variants ready for use on web
+- **Handles any file size** - no memory or CPU constraints
+- **Easier to maintain** - clear separation of concerns
+
+**Cons:**
+- Metadata not immediately available (typically ready within seconds)
+- Requires Queue infrastructure (Cloudflare Queues)
+- Client must handle "metadata processing" state
+
+**Why This is Best:**
+- Users care most about fast uploads and image availability
+- Metadata is "nice to have" and rarely needed immediately
+- Simplifies error handling (retry metadata extraction independently)
+- Easier to test and debug
+- Better performance characteristics
+
+**Best for:** ✅ **ALL use cases** - this should be your default approach
+
+---
+
+#### Strategy 2: Edge Extraction (Alternative for Special Cases)
 
 Extract metadata directly in the Worker during upload.
 
@@ -1139,38 +1178,28 @@ Extract metadata directly in the Worker during upload.
 - May timeout on large files
 - Limited by Worker CPU/memory constraints
 - Blocks upload response
+- Inconsistent response times
 
-**Best for:** Images < 5MB, quick EXIF extraction
+**Best for:** ⚠️ Only if you have hard requirement for immediate metadata (rare)
 
-#### Strategy 2: Deferred Processing (Recommended for Large Images)
+---
 
-Upload to Cloudflare Images first, then extract metadata asynchronously.
-
-**Pros:**
-- Fast upload response
-- No Worker timeout issues
-- Can handle large files
-- Can use Durable Objects or Queues
-
-**Cons:**
-- Metadata not immediately available
-- More complex architecture
-- Requires additional infrastructure (Queue, Durable Object, or separate Worker)
-
-**Best for:** Images > 5MB, complex C2PA verification
-
-#### Strategy 3: Hybrid Approach (Recommended)
+#### Strategy 3: Hybrid Approach (Not Recommended)
 
 Extract lightweight metadata (basic EXIF) at edge, defer heavy processing (C2PA verification).
 
 **Pros:**
-- Best of both worlds
+- Some metadata immediately available
 - Fast response with basic data
-- Full metadata available shortly after
 
 **Cons:**
-- Most complex to implement
+- **Most complex to implement**
 - Requires careful state management
+- Two code paths to maintain
+- Still subject to Worker timeouts on large files
+- Inconsistent: sometimes has metadata, sometimes doesn't
+
+**Best for:** ❌ **Not recommended** - adds complexity without significant benefit
 
 ### Library Compatibility
 
@@ -1261,43 +1290,37 @@ await env.METADATA_QUEUE.send({
 
 ### Implementation Examples
 
-#### Example 1: Basic EXIF Extraction in Worker
+#### Example 1: Deferred Processing Upload Endpoint (⭐ RECOMMENDED)
+
+This is the cleanest, simplest implementation - upload and defer ALL metadata extraction.
 
 ```typescript
 import { Router } from 'itty-router';
-import exifr from 'exifr';
 
 const router = Router();
 
 router.post('/api/v1/images', async (request, env) => {
   const formData = await request.formData();
   const imageFile = formData.get('image');
+  const description = formData.get('description');
+  const uploadedBy = formData.get('uploaded_by');
 
   if (!imageFile || !(imageFile instanceof File)) {
-    return new Response('No image provided', { status: 400 });
+    return new Response(
+      JSON.stringify({ success: false, error: 'No image provided' }),
+      { status: 400, headers: { 'Content-Type': 'application/json' } }
+    );
   }
 
-  // Read file as ArrayBuffer
-  const arrayBuffer = await imageFile.arrayBuffer();
+  // Validate file type
+  if (!imageFile.type.startsWith('image/')) {
+    return new Response(
+      JSON.stringify({ success: false, error: 'Invalid file type' }),
+      { status: 400, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
 
-  // Extract EXIF data (fast, <10ms typically)
-  const exifData = await exifr.parse(arrayBuffer, {
-    tiff: true,
-    exif: true,
-    gps: true,
-    iptc: false,
-    icc: false,
-    pick: [
-      'Make', 'Model', 'DateTime', 'DateTimeOriginal',
-      'FocalLength', 'FNumber', 'ISO', 'LensModel',
-      'latitude', 'longitude', 'altitude'
-    ]
-  });
-
-  // Get basic image info
-  const { width, height } = await getImageDimensions(arrayBuffer);
-
-  // Upload to Cloudflare Images
+  // Upload to Cloudflare Images immediately
   const uploadForm = new FormData();
   uploadForm.append('file', imageFile);
 
@@ -1312,170 +1335,212 @@ router.post('/api/v1/images', async (request, env) => {
     }
   );
 
+  if (!uploadResponse.ok) {
+    return new Response(
+      JSON.stringify({ success: false, error: 'Cloudflare upload failed' }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+
   const uploadResult = await uploadResponse.json();
   const cloudflareImageId = uploadResult.result.id;
+  const variants = uploadResult.result.variants;
 
-  // Store in D1
-  const imageId = generateId();
+  // Generate image ID
+  const imageId = `img_${crypto.randomUUID()}`;
+  const now = Date.now();
+
+  // Store basic record in D1 (NO metadata yet)
   await env.DB.prepare(`
     INSERT INTO images (
       id, original_filename, cloudflare_image_id,
-      mime_type, file_size, width, height,
-      exif_data, uploaded_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      mime_type, file_size,
+      description, uploaded_by,
+      cloudflare_url_public, variants,
+      status, uploaded_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).bind(
     imageId,
     imageFile.name,
     cloudflareImageId,
     imageFile.type,
     imageFile.size,
-    width,
-    height,
-    JSON.stringify(exifData),
-    Date.now(),
-    Date.now()
+    description || null,
+    uploadedBy || null,
+    variants[0], // First variant URL
+    JSON.stringify(variants),
+    'active',
+    now,
+    now
   ).run();
 
-  return Response.json({
-    success: true,
-    data: {
-      id: imageId,
-      exif_data: exifData
-    }
-  });
-});
-
-// Helper to get image dimensions
-async function getImageDimensions(buffer: ArrayBuffer): Promise<{width: number, height: number}> {
-  // Use exifr or parse JPEG/PNG headers manually
-  const exif = await exifr.parse(buffer, {
-    tiff: false,
-    exif: false,
-    pick: ['ImageWidth', 'ImageHeight']
-  });
-
-  return {
-    width: exif?.ImageWidth || 0,
-    height: exif?.ImageHeight || 0
-  };
-}
-```
-
-#### Example 2: Deferred IPTC and C2PA Processing
-
-```typescript
-router.post('/api/v1/images', async (request, env) => {
-  const formData = await request.formData();
-  const imageFile = formData.get('image');
-
-  // Quick EXIF extraction
-  const arrayBuffer = await imageFile.arrayBuffer();
-  const basicExif = await exifr.parse(arrayBuffer, {
-    exif: true,
-    pick: ['Make', 'Model', 'DateTime']
-  });
-
-  // Upload to Cloudflare Images immediately
-  const cloudflareImageId = await uploadToCloudflareImages(imageFile, env);
-
-  // Generate image ID
-  const imageId = generateId();
-
-  // Store basic data immediately
-  await env.DB.prepare(`
-    INSERT INTO images (
-      id, original_filename, cloudflare_image_id,
-      exif_data, uploaded_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?)
-  `).bind(
-    imageId,
-    imageFile.name,
-    cloudflareImageId,
-    JSON.stringify(basicExif),
-    Date.now(),
-    Date.now()
-  ).run();
-
-  // Queue heavy metadata extraction
+  // Queue metadata extraction for ALL metadata types
   await env.METADATA_QUEUE.send({
     imageId: imageId,
     cloudflareImageId: cloudflareImageId,
-    tasks: ['full_exif', 'iptc', 'c2pa']
+    originalFilename: imageFile.name
   });
 
+  // Return immediately - image is ready to use!
   return Response.json({
     success: true,
     data: {
       id: imageId,
+      original_filename: imageFile.name,
       cloudflare_image_id: cloudflareImageId,
-      exif_data: basicExif,
-      metadata_status: 'processing' // Indicates async processing
+      mime_type: imageFile.type,
+      file_size: imageFile.size,
+      cloudflare_url_public: variants[0],
+      variants: variants,
+      metadata_status: 'processing', // Will be updated by queue worker
+      uploaded_at: new Date(now).toISOString()
     }
   });
 });
+
+export default router;
 ```
 
-#### Example 3: Queue Consumer for Heavy Processing
+#### Example 2: Queue Consumer for Metadata Extraction
 
 ```typescript
 // metadata-worker.ts - Separate Worker or Queue Consumer
+import exifr from 'exifr';
+import { createC2pa } from 'c2pa';
+
 export default {
   async queue(batch: MessageBatch<MetadataJob>, env: Env) {
     for (const message of batch.messages) {
       const job = message.body;
 
-      // Fetch image from Cloudflare Images
-      const imageUrl = `https://imagedelivery.net/${env.CF_ACCOUNT_HASH}/${job.cloudflareImageId}/public`;
-      const response = await fetch(imageUrl);
-      const arrayBuffer = await response.arrayBuffer();
+      try {
+        // Mark as processing
+        await env.DB.prepare(`
+          UPDATE images SET metadata_status = ?, updated_at = ? WHERE id = ?
+        `).bind('processing', Date.now(), job.imageId).run();
 
-      let iptcData = null;
-      let c2paManifest = null;
-      let c2paVerified = false;
+        // Fetch image from Cloudflare Images
+        const imageUrl = `https://imagedelivery.net/${env.CF_ACCOUNT_HASH}/${job.cloudflareImageId}/public`;
+        const response = await fetch(imageUrl);
 
-      // Extract IPTC
-      if (job.tasks.includes('iptc')) {
-        iptcData = await exifr.parse(arrayBuffer, {
-          iptc: true,
-          translateKeys: true
-        });
-      }
+        if (!response.ok) {
+          throw new Error(`Failed to fetch image: ${response.status}`);
+        }
 
-      // Extract C2PA (if available)
-      if (job.tasks.includes('c2pa')) {
-        try {
-          const c2pa = await createC2pa();
-          const result = await c2pa.read(arrayBuffer);
+        const arrayBuffer = await response.arrayBuffer();
 
-          if (result) {
-            c2paManifest = result.active_manifest;
-            c2paVerified = result.validation_status?.some(
-              s => s.code === 'signingCredential.trusted'
-            ) || false;
-          }
-        } catch (error) {
-          console.error('C2PA extraction failed:', error);
+        // Extract ALL metadata types in parallel
+        const [exifData, iptcData, c2paResult] = await Promise.allSettled([
+          // Extract EXIF
+          exifr.parse(arrayBuffer, {
+            tiff: true,
+            exif: true,
+            gps: true,
+            translateKeys: true,
+            translateValues: true
+          }),
+          // Extract IPTC
+          exifr.parse(arrayBuffer, {
+            iptc: true,
+            translateKeys: true,
+            translateValues: true
+          }),
+          // Extract C2PA (may fail if not present)
+          (async () => {
+            try {
+              const c2pa = await createC2pa();
+              return await c2pa.read(arrayBuffer);
+            } catch (err) {
+              return null; // C2PA not present is OK
+            }
+          })()
+        ]);
+
+        // Process results
+        const exif = exifData.status === 'fulfilled' ? exifData.value : null;
+        const iptc = iptcData.status === 'fulfilled' ? iptcData.value : null;
+        const c2pa = c2paResult.status === 'fulfilled' ? c2paResult.value : null;
+
+        // Extract image dimensions
+        const width = exif?.ImageWidth || null;
+        const height = exif?.ImageHeight || null;
+
+        // Process C2PA verification
+        let c2paManifest = null;
+        let c2paVerified = false;
+        let c2paSignatureValid = null;
+        let c2paIssuer = null;
+
+        if (c2pa) {
+          c2paManifest = c2pa.active_manifest;
+          c2paSignatureValid = c2pa.validation_status?.some(
+            s => s.code === 'signingCredential.trusted'
+          ) || false;
+          c2paVerified = !!c2paManifest;
+          c2paIssuer = c2paManifest?.claim_generator_info?.[0]?.issuer || null;
+        }
+
+        // Update database with ALL metadata
+        await env.DB.prepare(`
+          UPDATE images
+          SET
+            width = ?,
+            height = ?,
+            exif_data = ?,
+            iptc_data = ?,
+            c2pa_manifest = ?,
+            c2pa_verified = ?,
+            c2pa_signature_valid = ?,
+            c2pa_issuer = ?,
+            metadata_status = ?,
+            updated_at = ?
+          WHERE id = ?
+        `).bind(
+          width,
+          height,
+          exif ? JSON.stringify(exif) : null,
+          iptc ? JSON.stringify(iptc) : null,
+          c2paManifest ? JSON.stringify(c2paManifest) : null,
+          c2paVerified,
+          c2paSignatureValid,
+          c2paIssuer,
+          'completed', // Mark as completed
+          Date.now(),
+          job.imageId
+        ).run();
+
+        // Optional: Trigger webhook
+        if (env.WEBHOOK_URL) {
+          await fetch(env.WEBHOOK_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              event: 'metadata.completed',
+              image_id: job.imageId,
+              has_exif: !!exif,
+              has_iptc: !!iptc,
+              has_c2pa: !!c2pa
+            })
+          });
+        }
+
+        message.ack();
+
+      } catch (error) {
+        console.error(`Metadata extraction failed for ${job.imageId}:`, error);
+
+        // Mark as failed
+        await env.DB.prepare(`
+          UPDATE images SET metadata_status = ?, updated_at = ? WHERE id = ?
+        `).bind('failed', Date.now(), job.imageId).run();
+
+        // Retry logic: retry up to 3 times
+        if (message.attempts < 3) {
+          message.retry();
+        } else {
+          message.ack(); // Give up after 3 attempts
         }
       }
-
-      // Update database with additional metadata
-      await env.DB.prepare(`
-        UPDATE images
-        SET
-          iptc_data = ?,
-          c2pa_manifest = ?,
-          c2pa_verified = ?,
-          updated_at = ?
-        WHERE id = ?
-      `).bind(
-        iptcData ? JSON.stringify(iptcData) : null,
-        c2paManifest ? JSON.stringify(c2paManifest) : null,
-        c2paVerified,
-        Date.now(),
-        job.imageId
-      ).run();
-
-      message.ack();
     }
   }
 };
@@ -1483,71 +1548,51 @@ export default {
 interface MetadataJob {
   imageId: string;
   cloudflareImageId: string;
-  tasks: ('full_exif' | 'iptc' | 'c2pa')[];
+  originalFilename: string;
 }
 ```
 
-#### Example 4: Complete Hybrid Implementation
+#### Example 3: Status Check Endpoint
+
+Allow clients to check if metadata processing is complete:
 
 ```typescript
-import exifr from 'exifr';
+router.get('/api/v1/images/:id/status', async (request, env) => {
+  const imageId = request.params.id;
 
-interface ExtractedMetadata {
-  exif: any;
-  iptc: any | null;
-  c2pa: any | null;
-  dimensions: { width: number; height: number };
-}
+  const image = await env.DB.prepare(`
+    SELECT
+      id,
+      metadata_status,
+      exif_data IS NOT NULL as has_exif,
+      iptc_data IS NOT NULL as has_iptc,
+      c2pa_manifest IS NOT NULL as has_c2pa,
+      updated_at
+    FROM images
+    WHERE id = ?
+  `).bind(imageId).first();
 
-async function extractAllMetadata(
-  arrayBuffer: ArrayBuffer,
-  options: { includeC2pa: boolean } = { includeC2pa: false }
-): Promise<ExtractedMetadata> {
-
-  // Extract EXIF + IPTC together (fast)
-  const [exifData, iptcData] = await Promise.all([
-    exifr.parse(arrayBuffer, {
-      tiff: true,
-      exif: true,
-      gps: true,
-      iptc: false,
-      translateKeys: true,
-      translateValues: true
-    }),
-    exifr.parse(arrayBuffer, {
-      tiff: false,
-      exif: false,
-      iptc: true,
-      translateKeys: true,
-      translateValues: true
-    })
-  ]);
-
-  // Extract dimensions
-  const dimensions = {
-    width: exifData?.ImageWidth || 0,
-    height: exifData?.ImageHeight || 0
-  };
-
-  // C2PA only if requested and small file
-  let c2paData = null;
-  if (options.includeC2pa && arrayBuffer.byteLength < 5_000_000) {
-    try {
-      const c2pa = await createC2pa();
-      const result = await c2pa.read(arrayBuffer);
-      c2paData = result?.active_manifest || null;
-    } catch (err) {
-      console.warn('C2PA extraction failed:', err);
-    }
+  if (!image) {
+    return new Response(
+      JSON.stringify({ success: false, error: 'Image not found' }),
+      { status: 404, headers: { 'Content-Type': 'application/json' } }
+    );
   }
 
-  return {
-    exif: exifData,
-    iptc: iptcData,
-    c2pa: c2paData,
-    dimensions
-  };
-}
+  return Response.json({
+    success: true,
+    data: {
+      id: image.id,
+      metadata_status: image.metadata_status,
+      metadata_available: {
+        exif: !!image.has_exif,
+        iptc: !!image.has_iptc,
+        c2pa: !!image.has_c2pa
+      },
+      last_updated: new Date(image.updated_at).toISOString()
+    }
+  });
+});
 ```
 
 ### Performance Optimization Tips
@@ -1659,27 +1704,41 @@ async function safeMetadataExtraction(buffer: ArrayBuffer) {
 }
 ```
 
-### Recommended Architecture
+### Recommended Architecture (Deferred-by-Default)
 
 **For Production:**
 
 1. **Upload Endpoint (Worker):**
-   - Extract basic EXIF (< 10ms)
-   - Upload to Cloudflare Images
-   - Store basic metadata in D1
-   - Queue full metadata extraction
-   - Return immediately
+   - ✅ Upload to Cloudflare Images
+   - ✅ Store basic record in D1 (ID, filename, Cloudflare ID, file size, MIME type)
+   - ✅ Queue metadata extraction job
+   - ✅ Return immediately with image ID and URLs
+   - ⏱️ **Target response time: < 500ms**
 
 2. **Metadata Queue Worker:**
    - Fetch image from Cloudflare Images
-   - Extract IPTC data
-   - Attempt C2PA verification
-   - Update D1 record
+   - Extract ALL metadata in single worker:
+     - EXIF data (camera, settings, GPS)
+     - IPTC data (copyright, creator, keywords)
+     - C2PA manifest (content authenticity)
+   - Update D1 record with all metadata
    - Optional: Trigger webhook when complete
+   - ⏱️ **Typical processing time: 1-5 seconds**
 
-3. **Status Endpoint:**
-   - Allow clients to check metadata processing status
-   - Return partial data if still processing
+3. **Read Endpoint:**
+   - Query D1 for image record
+   - Return image data with metadata (if available)
+   - Include `metadata_status` field: 'processing', 'completed', 'failed'
+   - Client can poll or use webhooks for status updates
+
+**Architecture Benefits:**
+
+- **Simple:** Single code path, easy to reason about
+- **Fast:** Upload response in milliseconds, not seconds
+- **Reliable:** No Worker timeout issues
+- **Scalable:** Queue handles burst traffic
+- **Debuggable:** Can retry metadata extraction independently
+- **Testable:** Easy to test upload and extraction separately
 
 ### Testing Metadata Extraction
 
@@ -1725,12 +1784,25 @@ test('extracts EXIF from JPEG', async () => {
 
 | Metadata Type | Difficulty | Library | Edge Compatible | Recommendation |
 |---------------|------------|---------|-----------------|----------------|
-| EXIF | Easy | exifr | ✅ Yes | Extract at edge |
-| IPTC | Easy | exifr | ✅ Yes | Extract at edge |
-| C2PA | Hard | c2pa-js | ⚠️ Partial | Defer to queue for files > 2MB |
-| Image Dimensions | Easy | exifr | ✅ Yes | Extract at edge |
+| EXIF | Easy | exifr | ✅ Yes | ⭐ Defer to queue |
+| IPTC | Easy | exifr | ✅ Yes | ⭐ Defer to queue |
+| C2PA | Hard | c2pa-js | ⚠️ Partial | ⭐ Defer to queue |
+| Image Dimensions | Easy | exifr | ✅ Yes | ⭐ Defer to queue |
 
-**Best Practice:** Use the hybrid approach - extract EXIF/IPTC at edge for immediate availability, defer C2PA verification to a queue worker for thorough processing.
+**Best Practice: Defer ALL metadata extraction to a queue worker.**
+
+**Why?**
+- Simplest architecture (single code path)
+- Fastest upload response times (< 500ms)
+- No Worker timeout concerns
+- Images immediately available via Cloudflare URLs
+- Metadata typically ready within 1-5 seconds
+- Easy to retry on failure
+
+**Implementation:**
+1. Upload → Store basic record → Queue job → Return immediately
+2. Queue worker fetches image and extracts all metadata
+3. Client polls for metadata or uses webhooks
 
 ---
 
