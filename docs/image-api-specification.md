@@ -1103,6 +1103,637 @@ Extract and verify C2PA manifests:
 
 ---
 
+## Image Metadata Extraction Implementation in Cloudflare Workers
+
+### Overview
+
+Extracting image metadata (EXIF, IPTC, C2PA) in Cloudflare Workers presents unique challenges due to the edge runtime environment. This section covers implementation strategies, library choices, and code examples specific to Cloudflare Workers.
+
+### Cloudflare Workers Constraints
+
+**Runtime Limitations:**
+- **CPU Time:** 50ms for free tier, 50-500ms for paid (configurable)
+- **Memory:** 128MB limit
+- **No Node.js APIs:** Limited to Web Standards APIs
+- **No native modules:** Must use pure JavaScript/WebAssembly
+- **No filesystem:** All operations in-memory
+
+**Implications for Image Processing:**
+- Large images may exceed memory limits
+- Complex metadata extraction may exceed CPU time
+- Must use edge-compatible libraries
+- Consider asynchronous/deferred processing for large files
+
+### Implementation Strategies
+
+#### Strategy 1: Edge Extraction (Recommended for Small-Medium Images)
+
+Extract metadata directly in the Worker during upload.
+
+**Pros:**
+- Immediate metadata availability
+- Single-step upload process
+- No additional infrastructure
+
+**Cons:**
+- May timeout on large files
+- Limited by Worker CPU/memory constraints
+- Blocks upload response
+
+**Best for:** Images < 5MB, quick EXIF extraction
+
+#### Strategy 2: Deferred Processing (Recommended for Large Images)
+
+Upload to Cloudflare Images first, then extract metadata asynchronously.
+
+**Pros:**
+- Fast upload response
+- No Worker timeout issues
+- Can handle large files
+- Can use Durable Objects or Queues
+
+**Cons:**
+- Metadata not immediately available
+- More complex architecture
+- Requires additional infrastructure (Queue, Durable Object, or separate Worker)
+
+**Best for:** Images > 5MB, complex C2PA verification
+
+#### Strategy 3: Hybrid Approach (Recommended)
+
+Extract lightweight metadata (basic EXIF) at edge, defer heavy processing (C2PA verification).
+
+**Pros:**
+- Best of both worlds
+- Fast response with basic data
+- Full metadata available shortly after
+
+**Cons:**
+- Most complex to implement
+- Requires careful state management
+
+### Library Compatibility
+
+#### EXIF Extraction
+
+**exifr** (Recommended)
+- **Status:** ✅ Works in Cloudflare Workers
+- **Size:** ~50KB minified
+- **Speed:** Fast, optimized for browsers
+- **Installation:** `npm install exifr`
+
+```typescript
+import exifr from 'exifr';
+
+// Works with ArrayBuffer or Blob
+const exif = await exifr.parse(imageBuffer, {
+  tiff: true,
+  exif: true,
+  gps: true,
+  iptc: false, // Disable if not needed
+  icc: false
+});
+```
+
+**piexifjs**
+- **Status:** ⚠️ May work with modifications
+- **Size:** Smaller than exifr
+- **Note:** Designed for browser, may need polyfills
+
+#### IPTC Extraction
+
+**exifr** (with IPTC enabled)
+- **Status:** ✅ Works in Cloudflare Workers
+- **Note:** Same library, just enable IPTC parsing
+
+```typescript
+import exifr from 'exifr';
+
+const iptc = await exifr.parse(imageBuffer, {
+  tiff: false,
+  exif: false,
+  iptc: true,  // Enable IPTC
+  translateKeys: true,  // Get human-readable keys
+  translateValues: true
+});
+```
+
+**iptc-reader**
+- **Status:** ❌ Not compatible (uses Node.js APIs)
+- **Alternative:** Use exifr or implement custom parser
+
+#### C2PA Verification
+
+**c2pa-js** (Adobe's official library)
+- **Status:** ⚠️ Partial compatibility
+- **Note:** Uses WebAssembly, may work in Workers
+- **Size:** Large (~1MB+)
+- **Installation:** `npm install c2pa`
+
+```typescript
+import { createC2pa } from 'c2pa';
+
+const c2pa = await createC2pa();
+const result = await c2pa.read(imageBuffer);
+
+if (result) {
+  const manifest = result.active_manifest;
+  const isValid = result.validation_status.some(
+    s => s.code === 'signingCredential.trusted'
+  );
+}
+```
+
+**Challenges:**
+- Large bundle size may exceed Worker limits
+- WASM initialization overhead
+- May need to defer to separate worker or Durable Object
+
+**Alternative Approach:**
+```typescript
+// Defer C2PA to Queue Worker
+await env.METADATA_QUEUE.send({
+  imageId: imageId,
+  cloudflareImageId: cfImageId,
+  task: 'c2pa_verification'
+});
+```
+
+### Implementation Examples
+
+#### Example 1: Basic EXIF Extraction in Worker
+
+```typescript
+import { Router } from 'itty-router';
+import exifr from 'exifr';
+
+const router = Router();
+
+router.post('/api/v1/images', async (request, env) => {
+  const formData = await request.formData();
+  const imageFile = formData.get('image');
+
+  if (!imageFile || !(imageFile instanceof File)) {
+    return new Response('No image provided', { status: 400 });
+  }
+
+  // Read file as ArrayBuffer
+  const arrayBuffer = await imageFile.arrayBuffer();
+
+  // Extract EXIF data (fast, <10ms typically)
+  const exifData = await exifr.parse(arrayBuffer, {
+    tiff: true,
+    exif: true,
+    gps: true,
+    iptc: false,
+    icc: false,
+    pick: [
+      'Make', 'Model', 'DateTime', 'DateTimeOriginal',
+      'FocalLength', 'FNumber', 'ISO', 'LensModel',
+      'latitude', 'longitude', 'altitude'
+    ]
+  });
+
+  // Get basic image info
+  const { width, height } = await getImageDimensions(arrayBuffer);
+
+  // Upload to Cloudflare Images
+  const uploadForm = new FormData();
+  uploadForm.append('file', imageFile);
+
+  const uploadResponse = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/images/v1`,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${env.CF_API_TOKEN}`
+      },
+      body: uploadForm
+    }
+  );
+
+  const uploadResult = await uploadResponse.json();
+  const cloudflareImageId = uploadResult.result.id;
+
+  // Store in D1
+  const imageId = generateId();
+  await env.DB.prepare(`
+    INSERT INTO images (
+      id, original_filename, cloudflare_image_id,
+      mime_type, file_size, width, height,
+      exif_data, uploaded_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    imageId,
+    imageFile.name,
+    cloudflareImageId,
+    imageFile.type,
+    imageFile.size,
+    width,
+    height,
+    JSON.stringify(exifData),
+    Date.now(),
+    Date.now()
+  ).run();
+
+  return Response.json({
+    success: true,
+    data: {
+      id: imageId,
+      exif_data: exifData
+    }
+  });
+});
+
+// Helper to get image dimensions
+async function getImageDimensions(buffer: ArrayBuffer): Promise<{width: number, height: number}> {
+  // Use exifr or parse JPEG/PNG headers manually
+  const exif = await exifr.parse(buffer, {
+    tiff: false,
+    exif: false,
+    pick: ['ImageWidth', 'ImageHeight']
+  });
+
+  return {
+    width: exif?.ImageWidth || 0,
+    height: exif?.ImageHeight || 0
+  };
+}
+```
+
+#### Example 2: Deferred IPTC and C2PA Processing
+
+```typescript
+router.post('/api/v1/images', async (request, env) => {
+  const formData = await request.formData();
+  const imageFile = formData.get('image');
+
+  // Quick EXIF extraction
+  const arrayBuffer = await imageFile.arrayBuffer();
+  const basicExif = await exifr.parse(arrayBuffer, {
+    exif: true,
+    pick: ['Make', 'Model', 'DateTime']
+  });
+
+  // Upload to Cloudflare Images immediately
+  const cloudflareImageId = await uploadToCloudflareImages(imageFile, env);
+
+  // Generate image ID
+  const imageId = generateId();
+
+  // Store basic data immediately
+  await env.DB.prepare(`
+    INSERT INTO images (
+      id, original_filename, cloudflare_image_id,
+      exif_data, uploaded_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+  `).bind(
+    imageId,
+    imageFile.name,
+    cloudflareImageId,
+    JSON.stringify(basicExif),
+    Date.now(),
+    Date.now()
+  ).run();
+
+  // Queue heavy metadata extraction
+  await env.METADATA_QUEUE.send({
+    imageId: imageId,
+    cloudflareImageId: cloudflareImageId,
+    tasks: ['full_exif', 'iptc', 'c2pa']
+  });
+
+  return Response.json({
+    success: true,
+    data: {
+      id: imageId,
+      cloudflare_image_id: cloudflareImageId,
+      exif_data: basicExif,
+      metadata_status: 'processing' // Indicates async processing
+    }
+  });
+});
+```
+
+#### Example 3: Queue Consumer for Heavy Processing
+
+```typescript
+// metadata-worker.ts - Separate Worker or Queue Consumer
+export default {
+  async queue(batch: MessageBatch<MetadataJob>, env: Env) {
+    for (const message of batch.messages) {
+      const job = message.body;
+
+      // Fetch image from Cloudflare Images
+      const imageUrl = `https://imagedelivery.net/${env.CF_ACCOUNT_HASH}/${job.cloudflareImageId}/public`;
+      const response = await fetch(imageUrl);
+      const arrayBuffer = await response.arrayBuffer();
+
+      let iptcData = null;
+      let c2paManifest = null;
+      let c2paVerified = false;
+
+      // Extract IPTC
+      if (job.tasks.includes('iptc')) {
+        iptcData = await exifr.parse(arrayBuffer, {
+          iptc: true,
+          translateKeys: true
+        });
+      }
+
+      // Extract C2PA (if available)
+      if (job.tasks.includes('c2pa')) {
+        try {
+          const c2pa = await createC2pa();
+          const result = await c2pa.read(arrayBuffer);
+
+          if (result) {
+            c2paManifest = result.active_manifest;
+            c2paVerified = result.validation_status?.some(
+              s => s.code === 'signingCredential.trusted'
+            ) || false;
+          }
+        } catch (error) {
+          console.error('C2PA extraction failed:', error);
+        }
+      }
+
+      // Update database with additional metadata
+      await env.DB.prepare(`
+        UPDATE images
+        SET
+          iptc_data = ?,
+          c2pa_manifest = ?,
+          c2pa_verified = ?,
+          updated_at = ?
+        WHERE id = ?
+      `).bind(
+        iptcData ? JSON.stringify(iptcData) : null,
+        c2paManifest ? JSON.stringify(c2paManifest) : null,
+        c2paVerified,
+        Date.now(),
+        job.imageId
+      ).run();
+
+      message.ack();
+    }
+  }
+};
+
+interface MetadataJob {
+  imageId: string;
+  cloudflareImageId: string;
+  tasks: ('full_exif' | 'iptc' | 'c2pa')[];
+}
+```
+
+#### Example 4: Complete Hybrid Implementation
+
+```typescript
+import exifr from 'exifr';
+
+interface ExtractedMetadata {
+  exif: any;
+  iptc: any | null;
+  c2pa: any | null;
+  dimensions: { width: number; height: number };
+}
+
+async function extractAllMetadata(
+  arrayBuffer: ArrayBuffer,
+  options: { includeC2pa: boolean } = { includeC2pa: false }
+): Promise<ExtractedMetadata> {
+
+  // Extract EXIF + IPTC together (fast)
+  const [exifData, iptcData] = await Promise.all([
+    exifr.parse(arrayBuffer, {
+      tiff: true,
+      exif: true,
+      gps: true,
+      iptc: false,
+      translateKeys: true,
+      translateValues: true
+    }),
+    exifr.parse(arrayBuffer, {
+      tiff: false,
+      exif: false,
+      iptc: true,
+      translateKeys: true,
+      translateValues: true
+    })
+  ]);
+
+  // Extract dimensions
+  const dimensions = {
+    width: exifData?.ImageWidth || 0,
+    height: exifData?.ImageHeight || 0
+  };
+
+  // C2PA only if requested and small file
+  let c2paData = null;
+  if (options.includeC2pa && arrayBuffer.byteLength < 5_000_000) {
+    try {
+      const c2pa = await createC2pa();
+      const result = await c2pa.read(arrayBuffer);
+      c2paData = result?.active_manifest || null;
+    } catch (err) {
+      console.warn('C2PA extraction failed:', err);
+    }
+  }
+
+  return {
+    exif: exifData,
+    iptc: iptcData,
+    c2pa: c2paData,
+    dimensions
+  };
+}
+```
+
+### Performance Optimization Tips
+
+#### 1. Use Streaming for Large Files
+
+```typescript
+// Instead of loading entire file into memory
+const stream = imageFile.stream();
+const reader = stream.getReader();
+
+// Process in chunks
+let buffer = new Uint8Array();
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+
+  // Only read first N bytes for EXIF (usually in first 64KB)
+  buffer = new Uint8Array([...buffer, ...value]);
+  if (buffer.length > 65536) break;
+}
+
+const exif = await exifr.parse(buffer);
+```
+
+#### 2. Selective Parsing
+
+```typescript
+// Only extract what you need
+const minimalExif = await exifr.parse(buffer, {
+  pick: ['Make', 'Model', 'DateTime', 'latitude', 'longitude'],
+  skip: ['thumbnail', 'Thumbnail'] // Skip thumbnail data
+});
+```
+
+#### 3. Timeout Protection
+
+```typescript
+const METADATA_TIMEOUT = 5000; // 5 seconds
+
+const metadataPromise = extractAllMetadata(buffer);
+const timeoutPromise = new Promise((_, reject) =>
+  setTimeout(() => reject(new Error('Metadata extraction timeout')), METADATA_TIMEOUT)
+);
+
+try {
+  const metadata = await Promise.race([metadataPromise, timeoutPromise]);
+} catch (error) {
+  // Fall back to deferred processing
+  await queueMetadataExtraction(imageId);
+}
+```
+
+#### 4. Conditional Extraction Based on File Size
+
+```typescript
+async function handleImageUpload(file: File, env: Env) {
+  const fileSize = file.size;
+
+  if (fileSize < 2_000_000) {
+    // Small file: extract everything immediately
+    return await extractAllMetadataSync(file, env);
+  } else if (fileSize < 10_000_000) {
+    // Medium file: extract EXIF/IPTC, defer C2PA
+    return await extractPartialMetadata(file, env);
+  } else {
+    // Large file: defer all heavy processing
+    return await deferAllMetadataExtraction(file, env);
+  }
+}
+```
+
+### Error Handling
+
+```typescript
+async function safeMetadataExtraction(buffer: ArrayBuffer) {
+  const metadata = {
+    exif: null,
+    iptc: null,
+    c2pa: null,
+    errors: []
+  };
+
+  // EXIF extraction
+  try {
+    metadata.exif = await exifr.parse(buffer, { exif: true });
+  } catch (error) {
+    metadata.errors.push({ type: 'exif', message: error.message });
+  }
+
+  // IPTC extraction
+  try {
+    metadata.iptc = await exifr.parse(buffer, { iptc: true });
+  } catch (error) {
+    metadata.errors.push({ type: 'iptc', message: error.message });
+  }
+
+  // C2PA extraction (most likely to fail)
+  try {
+    const c2pa = await createC2pa();
+    const result = await c2pa.read(buffer);
+    metadata.c2pa = result?.active_manifest;
+  } catch (error) {
+    metadata.errors.push({ type: 'c2pa', message: error.message });
+    // C2PA not present is not necessarily an error
+  }
+
+  return metadata;
+}
+```
+
+### Recommended Architecture
+
+**For Production:**
+
+1. **Upload Endpoint (Worker):**
+   - Extract basic EXIF (< 10ms)
+   - Upload to Cloudflare Images
+   - Store basic metadata in D1
+   - Queue full metadata extraction
+   - Return immediately
+
+2. **Metadata Queue Worker:**
+   - Fetch image from Cloudflare Images
+   - Extract IPTC data
+   - Attempt C2PA verification
+   - Update D1 record
+   - Optional: Trigger webhook when complete
+
+3. **Status Endpoint:**
+   - Allow clients to check metadata processing status
+   - Return partial data if still processing
+
+### Testing Metadata Extraction
+
+```typescript
+// Test with sample images
+const testImages = {
+  jpeg_with_exif: './test/images/sample_exif.jpg',
+  jpeg_with_iptc: './test/images/sample_iptc.jpg',
+  jpeg_with_c2pa: './test/images/sample_c2pa.jpg',
+  png_no_metadata: './test/images/sample_plain.png'
+};
+
+// Unit test
+test('extracts EXIF from JPEG', async () => {
+  const buffer = await readFile(testImages.jpeg_with_exif);
+  const exif = await exifr.parse(buffer);
+
+  expect(exif.Make).toBeDefined();
+  expect(exif.Model).toBeDefined();
+});
+```
+
+### Dependencies & Bundle Size
+
+**Recommended packages for Cloudflare Workers:**
+
+```json
+{
+  "dependencies": {
+    "exifr": "^7.1.3",
+    "c2pa": "^0.15.0"
+  }
+}
+```
+
+**Bundle size considerations:**
+- `exifr`: ~50KB minified
+- `c2pa`: ~1MB+ (WASM included)
+- **Total:** Keep under 1MB for Worker upload size limits
+- Consider code splitting if using C2PA
+
+### Summary
+
+| Metadata Type | Difficulty | Library | Edge Compatible | Recommendation |
+|---------------|------------|---------|-----------------|----------------|
+| EXIF | Easy | exifr | ✅ Yes | Extract at edge |
+| IPTC | Easy | exifr | ✅ Yes | Extract at edge |
+| C2PA | Hard | c2pa-js | ⚠️ Partial | Defer to queue for files > 2MB |
+| Image Dimensions | Easy | exifr | ✅ Yes | Extract at edge |
+
+**Best Practice:** Use the hybrid approach - extract EXIF/IPTC at edge for immediate availability, defer C2PA verification to a queue worker for thorough processing.
+
+---
+
 ## Cloudflare Images Integration
 
 ### Upload Flow
