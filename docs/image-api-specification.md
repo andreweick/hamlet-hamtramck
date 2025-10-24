@@ -10,7 +10,273 @@ This document specifies the design and implementation of an image management API
 - Comprehensive metadata extraction (EXIF, IPTC, C2PA)
 - Content authenticity verification via C2PA (Content Authenticity Initiative)
 - Integration with Cloudflare Images for storage
-- D1 database for structured metadata storage
+- Durable-first architecture with R2 as source of truth
+- D1 database as indexed view for fast queries
+- KV cache for hot-path optimization
+- Idempotent operations with deterministic IDs
+
+---
+
+## Architecture Philosophy
+
+### Durable-First Design
+
+This API follows a **durable-first** architecture pattern where data durability and recoverability are prioritized:
+
+**1. R2 as Source of Truth (Canonical Storage)**
+- **Purpose:** Immutable, append-only event log in JSONL format
+- **Content:** Complete image metadata records, one JSON object per line
+- **Durability:** R2 provides 11 nines of durability
+- **Recovery:** Can rebuild D1 and KV entirely from R2 if needed
+- **Format:** JSONL enables streaming, line-by-line processing
+
+**2. D1 as Indexed View (Query Layer)**
+- **Purpose:** Fast queries, filtering, sorting, pagination
+- **Content:** Only fields needed for search and list operations
+- **Relationship:** Derived from R2, can be rebuilt
+- **Updates:** Idempotent writes with `ON CONFLICT` clauses
+- **Role:** Searchable index, not source of truth
+
+**3. KV as Hot-Path Cache (Performance Layer)**
+- **Purpose:** Absorb read load for frequently accessed data
+- **Content:** Small summaries (recent images, user-specific lists)
+- **TTL:** Automatic expiration (e.g., 1 hour)
+- **Updates:** Write-through or write-behind
+- **Role:** Performance optimization, not required for correctness
+
+### Data Flow
+
+```
+[Upload Phase]
+Upload → Cloudflare Images → Store basic record in D1 → Queue metadata job → Return
+
+[Metadata Extraction Phase - Queue Worker]
+Fetch from Cloudflare Images
+    ↓
+Extract EXIF + IPTC + C2PA
+    ↓
+[1] Write complete record to R2 (JSONL) - SOURCE OF TRUTH
+    ↓
+[2] Update D1 (indexed view)
+    ↓
+[3] Update KV (cache hot paths)
+```
+
+**Why R2 write happens AFTER metadata extraction:**
+- R2 stores the COMPLETE, immutable record with all metadata
+- No need for partial writes or updates to R2
+- JSONL contains full context: upload info + all extracted metadata
+- Simpler: one append to R2 per image, not two
+
+### Key Principles
+
+**Idempotency:**
+- Every image has a deterministic ID based on content hash (SHA-256)
+- All writes use `INSERT ... ON CONFLICT(id) DO UPDATE ...`
+- Replays are safe - same input produces same result
+- Enables retry logic without duplication
+
+**Streaming Ingest:**
+- JSONL format allows line-by-line reading from R2
+- Can process millions of records without loading all into memory
+- Rebuild operations are efficient and resumable
+
+**Failure Recovery:**
+- If D1 is cleared: rebuild from R2 JSONL
+- If KV is cleared: performance degrades but data intact
+- If R2 is lost: catastrophic (but 11 nines durability)
+- Queue failures: retry with idempotent operations
+
+**Event Sourcing:**
+- R2 JSONL acts as event log
+- Can replay events to rebuild state
+- Audit trail of all changes
+- Temporal queries possible (by filtering JSONL by timestamp)
+
+---
+
+## Storage Architecture
+
+### R2 Storage (Source of Truth)
+
+**Bucket:** `images-metadata`
+
+**Structure:** JSONL (JSON Lines) - one complete record per line
+
+**File Organization:**
+```
+/images/YYYY/MM/DD/images.jsonl
+```
+
+Example: `/images/2025/10/24/images.jsonl`
+
+**Benefits:**
+- Date-based partitioning for efficient querying
+- Easy to append new records
+- Can process in parallel by date
+- Simple to archive old data
+
+**JSONL Record Format:**
+```jsonl
+{"id":"img_a1b2c3d4e5f6","original_filename":"photo.jpg","cloudflare_image_id":"cf_xyz789","mime_type":"image/jpeg","file_size":2048576,"width":4032,"height":3024,"uploaded_at":1729785600000,"uploaded_by":"user123","exif_data":{"Make":"Canon","Model":"EOS R5","DateTime":"2025:10:20 14:30:00","FocalLength":"50mm","FNumber":2.8,"ISO":100,"GPS":{"latitude":42.3923,"longitude":-83.0495}},"iptc_data":{"caption":"Sample photo","creator":"John Doe","copyright":"© 2025 John Doe","keywords":["nature","landscape"]},"c2pa_manifest":{"claim_generator":"Adobe Photoshop 24.0","signature_valid":true,"issuer":"Adobe Content Credentials"},"c2pa_verified":true,"c2pa_signature_valid":true,"c2pa_issuer":"Adobe Content Credentials","cloudflare_url_base":"https://imagedelivery.net/account-hash/cf_xyz789","cloudflare_url_public":"https://imagedelivery.net/account-hash/cf_xyz789/public","variants":["public","thumbnail","medium","large"],"description":"Sample description","tags":["nature","landscape"],"status":"active","is_public":false,"metadata_status":"completed","updated_at":1729785605000,"deleted_at":null,"_version":"1.0","_written_at":1729785605000}
+```
+
+**ID Generation (Deterministic):**
+```typescript
+// Content-addressable ID based on Cloudflare Image ID + original filename
+const id = `img_${sha256(`${cloudflareImageId}:${originalFilename}`).slice(0, 16)}`;
+```
+
+**Write Operations:**
+```typescript
+// Append complete record to R2 JSONL
+const date = new Date();
+const key = `images/${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getDate()).padStart(2, '0')}/images.jsonl`;
+
+const record = {
+  id: imageId,
+  original_filename: originalFilename,
+  cloudflare_image_id: cloudflareImageId,
+  // ... all metadata fields
+  _version: '1.0',
+  _written_at: Date.now()
+};
+
+// Append to existing file or create new
+const existingContent = await env.R2_BUCKET.get(key);
+const newLine = JSON.stringify(record) + '\n';
+
+if (existingContent) {
+  const existingText = await existingContent.text();
+  await env.R2_BUCKET.put(key, existingText + newLine);
+} else {
+  await env.R2_BUCKET.put(key, newLine);
+}
+```
+
+**Read Operations (Rebuild):**
+```typescript
+// Rebuild D1 from R2
+async function rebuildFromR2(env: Env) {
+  const objects = await env.R2_BUCKET.list({ prefix: 'images/' });
+
+  for (const obj of objects.objects) {
+    const content = await env.R2_BUCKET.get(obj.key);
+    const text = await content.text();
+    const lines = text.split('\n').filter(line => line.trim());
+
+    for (const line of lines) {
+      const record = JSON.parse(line);
+
+      // Idempotent insert
+      await env.DB.prepare(`
+        INSERT INTO images (id, original_filename, cloudflare_image_id, ...)
+        VALUES (?, ?, ?, ...)
+        ON CONFLICT(id) DO UPDATE SET
+          updated_at = excluded.updated_at,
+          metadata_status = excluded.metadata_status
+      `).bind(/* ... */).run();
+    }
+  }
+}
+```
+
+---
+
+### KV Storage (Hot-Path Cache)
+
+**Namespace:** `IMAGES_CACHE`
+
+**Purpose:** Cache frequently accessed data to reduce D1 queries
+
+**Cached Data:**
+
+**1. Recent Images (Global)**
+```typescript
+// Key: recent_images
+// TTL: 1 hour
+// Value: Array of last 20 uploaded images
+await env.IMAGES_CACHE.put(
+  'recent_images',
+  JSON.stringify([
+    { id: 'img_123', original_filename: 'photo.jpg', uploaded_at: '2025-10-24T12:00:00Z' },
+    // ... 19 more
+  ]),
+  { expirationTtl: 3600 }
+);
+```
+
+**2. User's Recent Images**
+```typescript
+// Key: recent_images:user:{userId}
+// TTL: 30 minutes
+// Value: Array of user's last 10 images
+await env.IMAGES_CACHE.put(
+  `recent_images:user:${userId}`,
+  JSON.stringify(userRecentImages),
+  { expirationTtl: 1800 }
+);
+```
+
+**3. Individual Image Cache**
+```typescript
+// Key: image:{imageId}
+// TTL: 1 hour
+// Value: Complete image record
+await env.IMAGES_CACHE.put(
+  `image:${imageId}`,
+  JSON.stringify(imageRecord),
+  { expirationTtl: 3600 }
+);
+```
+
+**4. Metadata Status Cache**
+```typescript
+// Key: metadata_status:{imageId}
+// TTL: 5 minutes (short TTL for processing status)
+// Value: Simple status string
+await env.IMAGES_CACHE.put(
+  `metadata_status:${imageId}`,
+  'completed',
+  { expirationTtl: 300 }
+);
+```
+
+**Cache Invalidation:**
+```typescript
+// When image is updated or deleted
+await env.IMAGES_CACHE.delete(`image:${imageId}`);
+await env.IMAGES_CACHE.delete(`metadata_status:${imageId}`);
+await env.IMAGES_CACHE.delete('recent_images');
+await env.IMAGES_CACHE.delete(`recent_images:user:${userId}`);
+```
+
+**Read Pattern (Cache-Aside):**
+```typescript
+async function getImage(imageId: string, env: Env) {
+  // Try cache first
+  const cached = await env.IMAGES_CACHE.get(`image:${imageId}`);
+  if (cached) {
+    return JSON.parse(cached);
+  }
+
+  // Cache miss - query D1
+  const image = await env.DB.prepare('SELECT * FROM images WHERE id = ?')
+    .bind(imageId)
+    .first();
+
+  if (image) {
+    // Write back to cache
+    await env.IMAGES_CACHE.put(
+      `image:${imageId}`,
+      JSON.stringify(image),
+      { expirationTtl: 3600 }
+    );
+  }
+
+  return image;
+}
+```
 
 ---
 
@@ -520,10 +786,73 @@ await db
 
 ## API Endpoints
 
+### OpenAPI Compliance
+
+This API follows **OpenAPI 3.1.0** specification standards.
+
+**OpenAPI Document Location:** `/openapi.yaml` or `/openapi.json`
+
+**Key Requirements:**
+- All endpoints documented with OpenAPI spec
+- Request/response schemas defined
+- Error responses standardized
+- Authentication schemes defined
+- Examples provided for all operations
+
+**Standard Response Format:**
+```typescript
+{
+  success: boolean;
+  data?: T;           // On success
+  error?: {           // On failure
+    code: string;
+    message: string;
+    details?: any;
+  };
+  metadata?: {        // Optional pagination/context
+    page?: number;
+    limit?: number;
+    total_count?: number;
+    total_pages?: number;
+  };
+}
+```
+
+**Standard Error Codes:**
+- `INVALID_REQUEST` - Malformed request
+- `INVALID_FILE_TYPE` - Unsupported image format
+- `FILE_TOO_LARGE` - Exceeds size limit
+- `IMAGE_NOT_FOUND` - Image ID doesn't exist
+- `UNAUTHORIZED` - Missing/invalid authentication
+- `FORBIDDEN` - Insufficient permissions
+- `RATE_LIMIT_EXCEEDED` - Too many requests
+- `CLOUDFLARE_UPLOAD_FAILED` - Upload to Cloudflare failed
+- `METADATA_EXTRACTION_FAILED` - Metadata processing error
+- `DATABASE_ERROR` - D1 operation failed
+- `INTERNAL_SERVER_ERROR` - Unexpected error
+
+**Standard HTTP Status Codes:**
+- `200 OK` - Successful GET, PATCH
+- `201 Created` - Successful POST
+- `204 No Content` - Successful DELETE
+- `400 Bad Request` - Invalid input
+- `401 Unauthorized` - Authentication required
+- `403 Forbidden` - Access denied
+- `404 Not Found` - Resource not found
+- `413 Payload Too Large` - File exceeds limit
+- `429 Too Many Requests` - Rate limit exceeded
+- `500 Internal Server Error` - Server error
+- `503 Service Unavailable` - Temporary outage
+
 ### Base URL
 ```
 /api/v1/images
 ```
+
+### API Versioning
+- Version in URL path: `/api/v1/...`
+- Breaking changes require new version
+- Old versions supported for 6 months minimum
 
 ### 1. Create (Upload) Image
 
@@ -1465,6 +1794,15 @@ export default {
         const width = exif?.ImageWidth || null;
         const height = exif?.ImageHeight || null;
 
+        // Fetch original upload record from D1
+        const originalRecord = await env.DB.prepare(`
+          SELECT * FROM images WHERE id = ?
+        `).bind(job.imageId).first();
+
+        if (!originalRecord) {
+          throw new Error(`Image ${job.imageId} not found in D1`);
+        }
+
         // Process C2PA verification
         let c2paManifest = null;
         let c2paVerified = false;
@@ -1480,34 +1818,126 @@ export default {
           c2paIssuer = c2paManifest?.claim_generator_info?.[0]?.issuer || null;
         }
 
-        // Update database with ALL metadata
-        await env.DB.prepare(`
-          UPDATE images
-          SET
-            width = ?,
-            height = ?,
-            exif_data = ?,
-            iptc_data = ?,
-            c2pa_manifest = ?,
-            c2pa_verified = ?,
-            c2pa_signature_valid = ?,
-            c2pa_issuer = ?,
-            metadata_status = ?,
-            updated_at = ?
-          WHERE id = ?
-        `).bind(
+        const now = Date.now();
+
+        // Build complete record
+        const completeRecord = {
+          id: job.imageId,
+          original_filename: originalRecord.original_filename,
+          cloudflare_image_id: job.cloudflareImageId,
+          mime_type: originalRecord.mime_type,
+          file_size: originalRecord.file_size,
           width,
           height,
+          uploaded_at: originalRecord.uploaded_at,
+          uploaded_by: originalRecord.uploaded_by,
+          exif_data: exif,
+          iptc_data: iptc,
+          c2pa_manifest: c2paManifest,
+          c2pa_verified: c2paVerified,
+          c2pa_signature_valid: c2paSignatureValid,
+          c2pa_issuer: c2paIssuer,
+          cloudflare_url_base: originalRecord.cloudflare_url_base,
+          cloudflare_url_public: originalRecord.cloudflare_url_public,
+          variants: JSON.parse(originalRecord.variants || '[]'),
+          description: originalRecord.description,
+          tags: JSON.parse(originalRecord.tags || '[]'),
+          status: 'active',
+          is_public: originalRecord.is_public,
+          metadata_status: 'completed',
+          updated_at: now,
+          deleted_at: null,
+          _version: '1.0',
+          _written_at: now
+        };
+
+        // [1] Write to R2 (SOURCE OF TRUTH) - JSONL append
+        const date = new Date();
+        const r2Key = `images/${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getDate()).padStart(2, '0')}/images.jsonl`;
+
+        const jsonLine = JSON.stringify(completeRecord) + '\n';
+
+        // Append to existing JSONL or create new
+        const existingR2 = await env.R2_BUCKET.get(r2Key);
+        if (existingR2) {
+          const existingText = await existingR2.text();
+          await env.R2_BUCKET.put(r2Key, existingText + jsonLine);
+        } else {
+          await env.R2_BUCKET.put(r2Key, jsonLine);
+        }
+
+        // [2] Update D1 (INDEXED VIEW) - Idempotent
+        await env.DB.prepare(`
+          INSERT INTO images (
+            id, original_filename, cloudflare_image_id,
+            mime_type, file_size, width, height,
+            uploaded_at, uploaded_by,
+            exif_data, iptc_data,
+            c2pa_manifest, c2pa_verified, c2pa_signature_valid, c2pa_issuer,
+            cloudflare_url_base, cloudflare_url_public, variants,
+            description, tags,
+            status, is_public, metadata_status,
+            updated_at, deleted_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            width = excluded.width,
+            height = excluded.height,
+            exif_data = excluded.exif_data,
+            iptc_data = excluded.iptc_data,
+            c2pa_manifest = excluded.c2pa_manifest,
+            c2pa_verified = excluded.c2pa_verified,
+            c2pa_signature_valid = excluded.c2pa_signature_valid,
+            c2pa_issuer = excluded.c2pa_issuer,
+            metadata_status = excluded.metadata_status,
+            updated_at = excluded.updated_at
+        `).bind(
+          job.imageId,
+          originalRecord.original_filename,
+          job.cloudflareImageId,
+          originalRecord.mime_type,
+          originalRecord.file_size,
+          width,
+          height,
+          originalRecord.uploaded_at,
+          originalRecord.uploaded_by,
           exif ? JSON.stringify(exif) : null,
           iptc ? JSON.stringify(iptc) : null,
           c2paManifest ? JSON.stringify(c2paManifest) : null,
           c2paVerified,
           c2paSignatureValid,
           c2paIssuer,
-          'completed', // Mark as completed
-          Date.now(),
-          job.imageId
+          originalRecord.cloudflare_url_base,
+          originalRecord.cloudflare_url_public,
+          originalRecord.variants,
+          originalRecord.description,
+          originalRecord.tags,
+          'active',
+          originalRecord.is_public,
+          'completed',
+          now,
+          null
         ).run();
+
+        // [3] Update KV Cache (HOT-PATH OPTIMIZATION)
+        // Cache the complete record
+        await env.IMAGES_CACHE.put(
+          `image:${job.imageId}`,
+          JSON.stringify(completeRecord),
+          { expirationTtl: 3600 } // 1 hour
+        );
+
+        // Update metadata status cache
+        await env.IMAGES_CACHE.put(
+          `metadata_status:${job.imageId}`,
+          'completed',
+          { expirationTtl: 300 } // 5 minutes
+        );
+
+        // Invalidate recent images caches (they'll be rebuilt on next read)
+        await env.IMAGES_CACHE.delete('recent_images');
+        if (originalRecord.uploaded_by) {
+          await env.IMAGES_CACHE.delete(`recent_images:user:${originalRecord.uploaded_by}`);
+        }
 
         // Optional: Trigger webhook
         if (env.WEBHOOK_URL) {
@@ -1721,24 +2151,93 @@ async function safeMetadataExtraction(buffer: ArrayBuffer) {
      - EXIF data (camera, settings, GPS)
      - IPTC data (copyright, creator, keywords)
      - C2PA manifest (content authenticity)
-   - Update D1 record with all metadata
+   - **[1] Write complete record to R2** (SOURCE OF TRUTH)
+   - **[2] Update D1 with idempotent INSERT/UPDATE** (INDEXED VIEW)
+   - **[3] Update KV cache** (HOT-PATH OPTIMIZATION)
    - Optional: Trigger webhook when complete
    - ⏱️ **Typical processing time: 1-5 seconds**
 
 3. **Read Endpoint:**
-   - Query D1 for image record
+   - Check KV cache first (hot path)
+   - If cache miss, query D1
+   - Update KV cache on read (cache-aside pattern)
    - Return image data with metadata (if available)
-   - Include `metadata_status` field: 'processing', 'completed', 'failed'
+   - Include `metadata_status` field: 'pending', 'processing', 'completed', 'failed'
    - Client can poll or use webhooks for status updates
+
+**Complete Data Flow (Upload → Metadata → Read):**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        UPLOAD PHASE                             │
+└─────────────────────────────────────────────────────────────────┘
+
+1. POST /api/v1/images
+   ↓
+2. Upload to Cloudflare Images → Get image ID + variants
+   ↓
+3. Generate deterministic ID: sha256(cloudflare_id:filename)
+   ↓
+4. INSERT basic record into D1 (metadata_status = 'pending')
+   ↓
+5. Queue.send({ imageId, cloudflareImageId, originalFilename })
+   ↓
+6. Return 201 with image ID + URLs (< 500ms)
+
+┌─────────────────────────────────────────────────────────────────┐
+│                   METADATA EXTRACTION PHASE                      │
+└─────────────────────────────────────────────────────────────────┘
+
+Queue Worker receives job:
+   ↓
+1. UPDATE D1: metadata_status = 'processing'
+   ↓
+2. Fetch image from Cloudflare Images
+   ↓
+3. Extract EXIF + IPTC + C2PA in parallel
+   ↓
+4. Build complete record with all metadata
+   ↓
+5. [R2] Append complete record to JSONL (images/YYYY/MM/DD/images.jsonl)
+   ↓
+6. [D1] INSERT ... ON CONFLICT DO UPDATE (idempotent)
+   ↓
+7. [KV] Write to cache with TTL
+   ↓
+8. Trigger webhook (optional)
+   ↓
+9. ACK message
+
+┌─────────────────────────────────────────────────────────────────┐
+│                         READ PHASE                              │
+└─────────────────────────────────────────────────────────────────┘
+
+GET /api/v1/images/:id
+   ↓
+1. Check KV cache: image:{id}
+   │
+   ├─ Cache HIT → Return cached data (< 10ms)
+   │
+   └─ Cache MISS:
+      ↓
+      2. Query D1 for image record
+         ↓
+      3. Update KV cache with result
+         ↓
+      4. Return image data (< 50ms)
+```
 
 **Architecture Benefits:**
 
 - **Simple:** Single code path, easy to reason about
 - **Fast:** Upload response in milliseconds, not seconds
+- **Durable:** R2 provides 11 nines durability
+- **Recoverable:** Can rebuild D1/KV entirely from R2
 - **Reliable:** No Worker timeout issues
-- **Scalable:** Queue handles burst traffic
+- **Scalable:** Queue handles burst traffic, KV absorbs read load
 - **Debuggable:** Can retry metadata extraction independently
 - **Testable:** Easy to test upload and extraction separately
+- **Idempotent:** Replays are safe with deterministic IDs
 
 ### Testing Metadata Extraction
 
